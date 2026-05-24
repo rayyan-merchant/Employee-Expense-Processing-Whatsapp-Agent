@@ -244,6 +244,18 @@ class ReceiptOCRService:
         }
         normalized = text.strip()
         lower = normalized.lower()
+        labels = r"amount|total|sum|vendor|merchant|store|supplier|date|category|description|desc|details|currency"
+
+        def field_value(label_pattern: str) -> str | None:
+            match = re.search(
+                rf"(?:{label_pattern})\s*[:\-]\s*(.*?)(?=\s+(?:{labels})\s*[:\-]|$)",
+                normalized,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if not match:
+                return None
+            value = " ".join(match.group(1).split()).strip(" ,;")
+            return value or None
 
         amount_match = re.search(r"(?:amount|total|sum|סכום)\s*[:\-]?\s*(?:₪|nis|ils|usd|eur|gbp)?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", lower, re.IGNORECASE)
         if not amount_match:
@@ -267,6 +279,7 @@ class ReceiptOCRService:
         vendor_match = re.search(r"(?:vendor|merchant|store|supplier|ספק)\s*[:\-]\s*([^\n\r,]+)", normalized, re.IGNORECASE)
         if vendor_match:
             data["vendor"] = vendor_match.group(1).strip()
+        data["vendor"] = field_value(r"vendor|merchant|store|supplier") or data["vendor"]
 
         date_match = re.search(r"(?:date|תאריך)\s*[:\-]\s*([0-9]{1,4}[./\-][0-9]{1,2}[./\-][0-9]{1,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", normalized, re.IGNORECASE)
         if not date_match:
@@ -281,6 +294,9 @@ class ReceiptOCRService:
         category_match = re.search(r"(?:category|קטגוריה)\s*[:\-]\s*([^\n\r,]+)", normalized, re.IGNORECASE)
         if category_match:
             data["category"] = parse_category_reply(category_match.group(1)) or category_match.group(1).strip()
+        category_field = field_value(r"category")
+        if category_field:
+            data["category"] = parse_category_reply(category_field) or category_field.strip()
         if not data["category"]:
             for token in re.split(r"[\n\r,|]+", normalized):
                 category = parse_category_reply(token)
@@ -293,6 +309,7 @@ class ReceiptOCRService:
             data["description"] = description_match.group(1).strip()
         else:
             data["description"] = normalized
+        data["description"] = field_value(r"description|desc|details") or data["description"]
 
         return data
 

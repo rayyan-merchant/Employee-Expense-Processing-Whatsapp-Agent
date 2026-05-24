@@ -123,3 +123,16 @@ async def test_parse_manual_structured_message_without_gemini(mocker):
     assert result["expense_date"] == "2025-12-19"
     assert result["category"] == "Other"
     gemini.assert_not_called()
+
+
+async def test_parse_manual_single_line_labels_do_not_bleed(mocker):
+    gemini = mocker.patch.object(ReceiptOCRService, "_call_gemini_json")
+    result = await ReceiptOCRService().parse_manual_details(
+        "Amount: 250 NIS Vendor: Cafe Aroma Date: 2026-05-25 Category: Meals Description: Team lunch"
+    )
+    assert result["amount"] == 250.0
+    assert result["vendor"] == "Cafe Aroma"
+    assert result["expense_date"] == "2026-05-25"
+    assert result["category"] == "Meals"
+    assert result["description"] == "Team lunch"
+    gemini.assert_not_called()
