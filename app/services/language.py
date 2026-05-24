@@ -47,6 +47,26 @@ TEMPLATES = {
     "error_generic": {"en": "Something went wrong on our end. Please try again.\n\nError reference: {error_id}", "he": "משהו השתבש מצדנו. אנא נסה שוב.\n\nמזהה שגיאה: {error_id}"},
     "cancelled": {"en": "Expense cancelled. Send a receipt photo whenever you're ready.", "he": "ההוצאה בוטלה. שלח תמונת קבלה כשתהיה מוכן."},
     "waiting": {"en": "Your expense is still being processed. Please wait a moment.", "he": "ההוצאה שלך עדיין בעיבוד. אנא המתן רגע."},
+    "unsupported_media": {
+        "en": "I can only process receipt photos (JPG or PNG). Please send a clear photo of your receipt.",
+        "he": "אני יכול לעבד רק תמונות של קבלות (JPG או PNG). אנא שלח תמונה ברורה של הקבלה שלך.",
+    },
+    "not_a_receipt": {
+        "en": "That doesn't look like a receipt. Please send a clear photo of your expense receipt, or type the details manually.",
+        "he": "זה לא נראה כמו קבלה. שלח תמונה ברורה של הקבלה שלך, או הקלד את הפרטים ידנית.",
+    },
+    "missing_required_fields": {
+        "en": "I'm missing some required details: {missing_fields}. Please provide: Amount | Vendor | Date | Category",
+        "he": "חסרים לי פרטים נדרשים: {missing_fields}. אנא ספק: סכום | ספק | תאריך | קטגוריה",
+    },
+    "restart_fresh": {
+        "en": "Starting fresh with your new receipt!",
+        "he": "מתחיל מחדש עם הקבלה החדשה שלך!",
+    },
+    "duplicate_detected": {
+        "en": "It looks like you already submitted this expense (Ref: {expense_id}). If this is a different expense, please wait a moment and try again.",
+        "he": "נראה שכבר הגשת את ההוצאה הזו (אסמכתא: {expense_id}). אם מדובר בהוצאה אחרת, המתן רגע ונסה שוב.",
+    },
 }
 
 CATEGORY_ALIASES = {
@@ -76,8 +96,8 @@ CANONICAL_CATEGORIES = ["Meals", "Travel", "Accommodation", "Entertainment", "Of
 def detect_language(text: str) -> str:
     non_space = [char for char in text if char.strip()]
     if non_space:
-        hebrew = sum(1 for char in non_space if "\u0590" <= char <= "\u05FF")
-        if hebrew / len(non_space) > 0.10:
+        semitic = sum(1 for char in non_space if "\u0590" <= char <= "\u05FF" or "\u0600" <= char <= "\u06FF")
+        if semitic / len(non_space) > 0.10:
             return "he"
     try:
         from langdetect import detect
@@ -108,6 +128,7 @@ def render_category_menu(lang: str) -> str:
 
 def parse_category_reply(text: str) -> str | None:
     cleaned = re.sub(r"[.!?,؟]", "", text.strip().lower()).strip()
+    cleaned = " ".join(cleaned.split())
     return CATEGORY_ALIASES.get(cleaned)
 
 

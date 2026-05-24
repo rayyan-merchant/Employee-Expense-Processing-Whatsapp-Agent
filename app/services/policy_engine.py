@@ -37,6 +37,22 @@ KNOWN_CATEGORIES = [
     "Conference",
     "Other",
 ]
+ABSOLUTE_MAX_AMOUNT = 100_000
+CATEGORY_MAP = {category.lower(): category for category in KNOWN_CATEGORIES}
+
+
+def normalize_category(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    cleaned = " ".join(str(raw).strip().split()).lower()
+    return CATEGORY_MAP.get(cleaned)
+
+
+def _parse_amount(raw) -> float:
+    try:
+        return round(float(raw or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _check_policy(category: str, amount: float, currency: str, expense_date_str: str | None, policy) -> PolicyResult:
@@ -76,13 +92,21 @@ def _check_policy(category: str, amount: float, currency: str, expense_date_str:
 
 class PolicyEngine:
     async def validate(self, expense_data: dict, db: AsyncSession) -> PolicyResult:
-        category = expense_data.get("category")
-        amount = round(float(expense_data.get("amount") or 0), 2)
+        category = normalize_category(expense_data.get("category"))
+        amount = _parse_amount(expense_data.get("amount"))
         currency = str(expense_data.get("currency") or "NIS").upper()
         expense_date_str = expense_data.get("expense_date")
+        if amount <= 0:
+            return PolicyResult(PolicyDecision.REJECTED, "Amount must be greater than zero")
+        if amount > ABSOLUTE_MAX_AMOUNT:
+            return PolicyResult(PolicyDecision.EXCEPTION, f"Amount {amount} NIS is unusually large and requires manual review")
         if category not in KNOWN_CATEGORIES:
             return PolicyResult(PolicyDecision.REJECTED, f"Unknown expense category: '{category}'")
-        policy = await get_policy(db, category)
+        try:
+            policy = await get_policy(db, category)
+        except Exception as exc:
+            logger.error("DB error fetching policy for %s: %s", category, exc)
+            return PolicyResult(PolicyDecision.EXCEPTION, "Policy lookup failed - sent for manual review", category)
         if policy is None or not policy.active:
             return PolicyResult(PolicyDecision.EXCEPTION, f"No active policy configured for {category}. Sent for manual review.", category)
         return _check_policy(category, amount, currency, expense_date_str, policy)
@@ -98,13 +122,21 @@ class SyncPolicyEngine:
     def validate(self, expense_data: dict, db: Session) -> PolicyResult:
         from app.models.policy import ExpensePolicy
 
-        category = expense_data.get("category")
-        amount = round(float(expense_data.get("amount") or 0), 2)
+        category = normalize_category(expense_data.get("category"))
+        amount = _parse_amount(expense_data.get("amount"))
         currency = str(expense_data.get("currency") or "NIS").upper()
         expense_date_str = expense_data.get("expense_date")
+        if amount <= 0:
+            return PolicyResult(PolicyDecision.REJECTED, "Amount must be greater than zero")
+        if amount > ABSOLUTE_MAX_AMOUNT:
+            return PolicyResult(PolicyDecision.EXCEPTION, f"Amount {amount} NIS is unusually large and requires manual review")
         if category not in KNOWN_CATEGORIES:
             return PolicyResult(PolicyDecision.REJECTED, f"Unknown expense category: '{category}'")
-        policy = db.query(ExpensePolicy).filter_by(category=category, active=True).first()
+        try:
+            policy = db.query(ExpensePolicy).filter_by(category=category, active=True).first()
+        except Exception as exc:
+            logger.error("DB error fetching policy for %s: %s", category, exc)
+            return PolicyResult(PolicyDecision.EXCEPTION, "Policy lookup failed - sent for manual review", category)
         if not policy:
             return PolicyResult(PolicyDecision.EXCEPTION, f"No active policy for {category}. Sent for manual review.", category)
         return _check_policy(category, amount, currency, expense_date_str, policy)

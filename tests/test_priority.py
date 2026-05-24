@@ -105,3 +105,76 @@ async def test_employee_unknown_phone(test_db):
     from app.models.employee import get_employee_by_phone
 
     assert await get_employee_by_phone(test_db, "999999999999") is None
+
+
+async def test_priority_409_on_header_continues_to_line_item(mock_expense, mocker):
+    mocker.patch("app.config.settings.PRIORITY_USE_MOCK", False)
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, status_code=200, data=None):
+            self.status_code = status_code
+            self._data = data or {}
+
+        def json(self):
+            return self._data
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://priority.test")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("error", request=request, response=response)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            calls.append(("post", url))
+            if url.endswith("/DOCUMENTS"):
+                return FakeResponse(409)
+            return FakeResponse(200)
+
+        async def patch(self, url, **kwargs):
+            calls.append(("patch", url))
+            return FakeResponse(200)
+
+    mocker.patch("httpx.AsyncClient", FakeClient)
+    result = await PriorityERPClient()._real_create_expense(mock_expense)
+    assert result.success is True
+    assert any("DOCUMENTLINES" in url for _, url in calls)
+
+
+async def test_priority_401_does_not_retry(mock_expense, mocker):
+    mocker.patch("app.config.settings.PRIORITY_USE_MOCK", False)
+
+    class FakeResponse:
+        status_code = 401
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "https://priority.test")
+            response = httpx.Response(401, request=request)
+            raise httpx.HTTPStatusError("auth", request=request, response=response)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            return FakeResponse()
+
+    mocker.patch("httpx.AsyncClient", FakeClient)
+    with pytest.raises(httpx.HTTPStatusError):
+        await PriorityERPClient()._real_create_expense(mock_expense)

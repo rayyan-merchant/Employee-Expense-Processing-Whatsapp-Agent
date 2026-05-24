@@ -33,6 +33,11 @@ class PriorityERPClient:
         }
 
     async def create_expense(self, expense) -> PriorityExpenseResult:
+        existing_doc = getattr(expense, "priority_document_id", None)
+        if isinstance(existing_doc, str) and existing_doc.strip():
+            doc_no = existing_doc
+            logger.warning("Priority upload skipped for %s; already uploaded as %s", getattr(expense, "id", "unknown"), doc_no)
+            return PriorityExpenseResult(success=True, document_no=doc_no, document_id=doc_no)
         if settings.use_priority_mock:
             return await self._mock.create_expense(expense)
         return await self._real_create_expense(expense)
@@ -44,21 +49,32 @@ class PriorityERPClient:
 
     async def _real_create_expense(self, expense) -> PriorityExpenseResult:
         doc_no = f"EXP-{expense.id[:8].upper()}"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            header_resp = await client.post(
-                f"{self.base_url}/DOCUMENTS",
-                headers=self._headers(),
-                json={
-                    "DOCNO": doc_no,
-                    "DOCTYPE": "EX",
-                    "CUSTNAME": expense.employee_id or "EMP001",
-                    "CURDATE": expense.expense_date,
-                    "DETAILS": expense.description or "",
-                    "STATDES": "Draft",
-                },
-            )
-            header_resp.raise_for_status()
-            doc_data = header_resp.json()
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            doc_data = {}
+            try:
+                header_resp = await client.post(
+                    f"{self.base_url}/DOCUMENTS",
+                    headers=self._headers(),
+                    json={
+                        "DOCNO": doc_no,
+                        "DOCTYPE": "EX",
+                        "CUSTNAME": expense.employee_id or "EMP001",
+                        "CURDATE": expense.expense_date,
+                        "DETAILS": expense.description or "",
+                        "STATDES": "Draft",
+                    },
+                )
+                header_resp.raise_for_status()
+                doc_data = header_resp.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    logger.info("Priority document %s already exists, continuing with line item", doc_no)
+                elif exc.response.status_code == 401:
+                    logger.critical("Priority ERP authentication failed - check credentials. NOT retrying.")
+                    raise
+                else:
+                    raise
             line_resp = await client.post(
                 f"{self.base_url}/DOCUMENTS('{doc_no}')/DOCUMENTLINES",
                 headers=self._headers(),

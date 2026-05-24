@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import Float, String, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,3 +77,36 @@ async def update_expense(db: AsyncSession, expense_id: str, **updates) -> Expens
 async def list_all_expenses(db: AsyncSession, limit: int = 100) -> list[Expense]:
     result = await db.execute(select(Expense).order_by(Expense.created_at.desc()).limit(limit))
     return list(result.scalars().all())
+
+
+async def find_potential_duplicate(
+    db: AsyncSession,
+    phone: str,
+    amount: float,
+    vendor: str | None,
+    expense_date: str,
+    category: str,
+) -> Expense | None:
+    cutoff = datetime.utcnow() - timedelta(minutes=10)
+    result = await db.execute(
+        select(Expense)
+        .where(
+            Expense.whatsapp_number == phone,
+            Expense.expense_date == expense_date,
+            Expense.category == category,
+        )
+        .order_by(Expense.created_at.desc())
+    )
+    for expense in result.scalars().all():
+        if expense.approval_status == "REJECTED" or expense.priority_status in {"FAILED", "PRIORITY_UPLOAD_FAILED"} or expense.policy_status == "REJECTED":
+            continue
+        try:
+            created_at = datetime.fromisoformat(expense.created_at)
+        except (TypeError, ValueError):
+            continue
+        if created_at < cutoff:
+            continue
+        if abs((expense.amount or 0) - amount) <= 0.01:
+            if not vendor or not expense.vendor or expense.vendor.strip().lower() == vendor.strip().lower():
+                return expense
+    return None

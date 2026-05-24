@@ -1,3 +1,4 @@
+import pytest
 from twilio.base.exceptions import TwilioRestException
 
 from app.services.whatsapp import WhatsAppService
@@ -97,3 +98,35 @@ def test_whatsapp_daily_limit_does_not_raise(mocker):
         ),
     )
     assert svc.send_message_sync("whatsapp:+972501234567", "hello") == ""
+
+
+def test_parse_incoming_adds_media_type(twilio_form_params):
+    svc = WhatsAppService()
+    params = twilio_form_params(has_media=True, media_url="https://api.twilio.com/test.jpg")
+    params["MediaContentType0"] = "image/jpeg; charset=binary"
+    parsed = svc.parse_incoming(params)
+    assert parsed["media_type"] == "image/jpeg"
+
+
+def test_parse_incoming_invalid_phone_raises(twilio_form_params):
+    svc = WhatsAppService()
+    params = twilio_form_params(phone="123")
+    with pytest.raises(ValueError):
+        svc.parse_incoming(params)
+
+
+async def test_safe_send_returns_false_on_error(mocker):
+    from app.services.whatsapp import safe_send
+
+    svc = WhatsAppService()
+    mocker.patch.object(svc, "send_message", side_effect=Exception("21211 invalid"))
+    assert await safe_send(svc, "whatsapp:+972501234567", "hello") is False
+
+
+async def test_safe_send_truncates_long_message(mocker):
+    from app.services.whatsapp import safe_send
+
+    svc = WhatsAppService()
+    send = mocker.patch.object(svc, "send_message", return_value="SM123")
+    assert await safe_send(svc, "whatsapp:+972501234567", "x" * 2000) is True
+    assert len(send.call_args.args[1]) == 1600

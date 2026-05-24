@@ -1,13 +1,16 @@
 import json
+import logging
 from datetime import datetime
 
 import redis as sync_redis
 import redis.asyncio as aioredis
+from pydantic import ValidationError
 
 from app.config import settings
 from app.models.schemas import ConversationState
 
 CONVERSATION_TTL = 3600
+logger = logging.getLogger(__name__)
 
 
 class ConversationFSM:
@@ -23,7 +26,12 @@ class ConversationFSM:
         raw = await self.redis.get(self._key(phone))
         if not raw:
             return None
-        return ConversationState(**json.loads(raw))
+        try:
+            return ConversationState(**json.loads(raw))
+        except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+            logger.error("Corrupted state for ...%s: %s. Resetting.", phone[-4:], exc)
+            await self.redis.delete(self._key(phone))
+            return None
 
     async def set_state(self, phone: str, state: ConversationState) -> None:
         state.updated_at = datetime.utcnow().isoformat()
@@ -42,6 +50,13 @@ class ConversationFSM:
 
     async def reset(self, phone: str) -> None:
         await self.redis.delete(self._key(phone))
+
+    async def acquire_lock(self, phone: str, timeout_seconds: int = 10) -> bool:
+        result = await self.redis.set(f"lock:{phone}", "1", nx=True, ex=timeout_seconds)
+        return result is not None
+
+    async def release_lock(self, phone: str) -> None:
+        await self.redis.delete(f"lock:{phone}")
 
     async def is_duplicate_message(self, phone: str, message_sid: str) -> bool:
         state = await self.get_state(phone)
@@ -67,7 +82,12 @@ class SyncConversationFSM:
         raw = self.redis.get(self._key(phone))
         if not raw:
             return None
-        return ConversationState(**json.loads(raw))
+        try:
+            return ConversationState(**json.loads(raw))
+        except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+            logger.error("Corrupted state for ...%s: %s. Resetting.", phone[-4:], exc)
+            self.redis.delete(self._key(phone))
+            return None
 
     def transition(self, phone: str, new_state_name: str, **updates) -> ConversationState:
         state = self.get_state(phone) or ConversationState(state=new_state_name, phone=phone)
@@ -81,3 +101,9 @@ class SyncConversationFSM:
 
     def reset(self, phone: str) -> None:
         self.redis.delete(self._key(phone))
+
+    def acquire_lock(self, phone: str, timeout_seconds: int = 10) -> bool:
+        return self.redis.set(f"lock:{phone}", "1", nx=True, ex=timeout_seconds) is not None
+
+    def release_lock(self, phone: str) -> None:
+        self.redis.delete(f"lock:{phone}")

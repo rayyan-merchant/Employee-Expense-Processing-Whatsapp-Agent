@@ -9,6 +9,7 @@ from sqlalchemy import text
 from app.config import settings
 from app.db.seed import seed_database
 from app.models.database import AsyncSessionLocal, create_tables
+from app.services.startup_checks import run_startup_checks
 
 logger = logging.getLogger(__name__)
 redis_client: aioredis.Redis | None = None
@@ -30,6 +31,11 @@ async def lifespan(app: FastAPI):
     async with AsyncSessionLocal() as db:
         await seed_database(db)
     logger.info("Seed data ready")
+    startup_errors = await run_startup_checks()
+    if startup_errors:
+        print("Startup checks found issues:")
+        for error in startup_errors:
+            print(f" - {error}")
     print(
         """
 +----------------------------------------------------------+

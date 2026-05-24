@@ -33,7 +33,7 @@ def process_expense_task(self, expense_id: str, phone: str):
     try:
         expense = db.query(Expense).filter_by(id=expense_id).first()
         if not expense:
-            logger.error("Expense %s not found in DB", expense_id)
+            logger.warning("Task %s: expense %s not found in DB. Skipping.", self.name, expense_id)
             return
         result = SyncPolicyEngine().validate(
             {
@@ -85,8 +85,6 @@ def process_expense_task(self, expense_id: str, phone: str):
 
 @celery_app.task(bind=True, max_retries=5, default_retry_delay=60, name="tasks.upload_to_priority")
 def upload_to_priority_task(self, expense_id: str, phone: str):
-    import asyncio
-
     from app.fsm.conversation import SyncConversationFSM
     from app.models.database import SyncSessionLocal
     from app.models.expense import Expense
@@ -98,9 +96,12 @@ def upload_to_priority_task(self, expense_id: str, phone: str):
     try:
         expense = db.query(Expense).filter_by(id=expense_id).first()
         if not expense:
-            logger.error("Expense %s not found for Priority upload", expense_id)
+            logger.warning("Task %s: expense %s not found in DB. Skipping.", self.name, expense_id)
             return
-        result = asyncio.run(PriorityERPClient().create_expense(expense))
+        if expense.priority_status == "UPLOADED" and expense.priority_document_id:
+            logger.warning("Expense %s already uploaded to Priority. Skipping.", expense_id)
+            return
+        result = _run_async_in_celery(PriorityERPClient().create_expense(expense))
         wa = WhatsAppService()
         fsm = SyncConversationFSM()
         lang = expense.language or "en"
@@ -132,3 +133,17 @@ def upload_to_priority_task(self, expense_id: str, phone: str):
             )
     finally:
         db.close()
+
+
+def _run_async_in_celery(coro):
+    import asyncio
+    import concurrent.futures
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, coro).result()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
