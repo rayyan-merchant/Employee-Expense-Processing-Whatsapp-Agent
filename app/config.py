@@ -8,9 +8,10 @@ class Settings(BaseSettings):
 
     GOOGLE_API_KEY: str = "AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-    REDIS_URL: str = "redis://localhost:6379/0"
-    CELERY_BROKER_URL: str = "redis://localhost:6379/1"
-    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
+    REDIS_URL: str = "redis://127.0.0.1:6379/0"
+    CELERY_BROKER_URL: str = "redis://127.0.0.1:6379/1"
+    CELERY_RESULT_BACKEND: str = "redis://127.0.0.1:6379/2"
+    CELERY_TASK_ALWAYS_EAGER: bool = True
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./expense_agent.db"
 

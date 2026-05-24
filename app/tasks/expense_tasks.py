@@ -15,6 +15,8 @@ celery_app.conf.task_serializer = "json"
 celery_app.conf.result_serializer = "json"
 celery_app.conf.accept_content = ["json"]
 celery_app.conf.timezone = "UTC"
+celery_app.conf.task_always_eager = settings.CELERY_TASK_ALWAYS_EAGER
+celery_app.conf.task_eager_propagates = False
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=30, name="tasks.process_expense")
