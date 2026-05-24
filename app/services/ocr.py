@@ -201,7 +201,11 @@ class ReceiptOCRService:
         with httpx.Client(timeout=40.0) as client:
             for generation_config in configs:
                 try:
-                    resp = client.post(url, params={"key": settings.GOOGLE_API_KEY}, json={**base_body, "generationConfig": generation_config})
+                    resp = client.post(
+                        url,
+                        headers={"x-goog-api-key": settings.GOOGLE_API_KEY},
+                        json={**base_body, "generationConfig": generation_config},
+                    )
                     resp.raise_for_status()
                     data = resp.json()
                     text = data["candidates"][0]["content"]["parts"][0]["text"]

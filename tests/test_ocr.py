@@ -136,3 +136,40 @@ async def test_parse_manual_single_line_labels_do_not_bleed(mocker):
     assert result["category"] == "Meals"
     assert result["description"] == "Team lunch"
     gemini.assert_not_called()
+
+
+def test_gemini_api_key_is_sent_in_header_not_url(mocker):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps({"amount": 12.0})}]}}
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return FakeResponse()
+
+    mocker.patch("app.services.ocr.httpx.Client", FakeClient)
+    result = ReceiptOCRService()._post_gemini("gemini-test", "prompt", {})
+    assert result["amount"] == 12.0
+    assert "key=" not in captured["url"]
+    assert "params" not in captured["kwargs"]
+    assert "x-goog-api-key" in captured["kwargs"]["headers"]
