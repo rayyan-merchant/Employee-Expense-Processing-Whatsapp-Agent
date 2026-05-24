@@ -1,10 +1,15 @@
 import asyncio
+import logging
 
 import httpx
+from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+TWILIO_DAILY_MESSAGE_LIMIT_ERROR = 63038
 
 
 def _clean_number(value: str | None) -> str:
@@ -24,8 +29,17 @@ class WhatsAppService:
         return self.validator.validate(url, params, signature)
 
     def send_message_sync(self, to: str, body: str) -> str:
-        msg = self.client.messages.create(from_=self.from_number, to=to, body=body)
-        return msg.sid
+        try:
+            msg = self.client.messages.create(from_=self.from_number, to=to, body=body)
+            return msg.sid
+        except TwilioRestException as exc:
+            if exc.code == TWILIO_DAILY_MESSAGE_LIMIT_ERROR:
+                logger.error(
+                    "Twilio daily WhatsApp message limit exceeded; outbound message to %s was not sent",
+                    _mask_whatsapp_number(to),
+                )
+                return ""
+            raise
 
     async def send_message(self, to: str, body: str) -> str:
         loop = asyncio.get_event_loop()
@@ -53,3 +67,8 @@ class WhatsAppService:
             )
             resp.raise_for_status()
             return resp.content
+
+
+def _mask_whatsapp_number(value: str) -> str:
+    clean = _clean_number(value)
+    return f"...{clean[-4:]}" if clean else "unknown"

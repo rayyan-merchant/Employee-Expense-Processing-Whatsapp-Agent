@@ -1,3 +1,8 @@
+from twilio.base.exceptions import TwilioRestException
+
+from app.services.whatsapp import WhatsAppService
+
+
 async def test_health_ok(client):
     resp = await client.get("/health")
     assert resp.status_code == 200
@@ -76,3 +81,19 @@ async def test_api_expenses_returns_list(client):
     resp = await client.get("/api/expenses")
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+def test_whatsapp_daily_limit_does_not_raise(mocker):
+    svc = WhatsAppService()
+    mocker.patch.object(
+        svc.client.messages,
+        "create",
+        side_effect=TwilioRestException(
+            status=429,
+            uri="/Messages.json",
+            msg="Daily message limit exceeded",
+            code=63038,
+            method="POST",
+        ),
+    )
+    assert svc.send_message_sync("whatsapp:+972501234567", "hello") == ""
