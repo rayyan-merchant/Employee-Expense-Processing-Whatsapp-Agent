@@ -130,3 +130,30 @@ async def test_safe_send_truncates_long_message(mocker):
     send = mocker.patch.object(svc, "send_message", return_value="SM123")
     assert await safe_send(svc, "whatsapp:+972501234567", "x" * 2000) is True
     assert len(send.call_args.args[1]) == 1600
+
+
+async def test_download_media_follows_twilio_redirect(mocker):
+    created = {}
+
+    class FakeResponse:
+        content = b"image-bytes"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            created.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    mocker.patch("httpx.AsyncClient", FakeClient)
+    assert await WhatsAppService().download_media("https://api.twilio.com/media") == b"image-bytes"
+    assert created["follow_redirects"] is True

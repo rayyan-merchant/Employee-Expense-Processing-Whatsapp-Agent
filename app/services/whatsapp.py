@@ -63,7 +63,7 @@ class WhatsAppService:
         }
 
     async def download_media(self, media_url: str) -> bytes:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(
                 media_url,
                 auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
