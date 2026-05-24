@@ -177,6 +177,9 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
             else:
                 await safe_send(wa, f"whatsapp:+{phone}", render_template("waiting", lang))
         elif current == "AWAITING_CATEGORY":
+            if _has_manual_detail_fields(body_clean):
+                await _process_manual_details(phone, body_clean, state.expense_data or {}, db, fsm, wa, lang)
+                return
             category = parse_category_reply(body_clean)
             if category:
                 expense_data = state.expense_data or {}
@@ -203,6 +206,8 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
             elif decision == "edit":
                 await fsm.transition(phone, "AWAITING_CORRECTION")
                 await safe_send(wa, f"whatsapp:+{phone}", render_template("correction_prompt", lang))
+            elif _has_manual_detail_fields(body_clean):
+                await _process_manual_details(phone, body_clean, state.expense_data or {}, db, fsm, wa, lang)
             else:
                 await safe_send(wa, f"whatsapp:+{phone}", format_expense_summary(state.expense_data or {}, lang))
         elif current == "AWAITING_CORRECTION":
@@ -293,6 +298,18 @@ def _looks_like_expense_text(text: str) -> bool:
         re.search(r"\b(amount|total|vendor|merchant|date|category|description|nis|ils|usd|eur|gbp)\b|₪|ש\"ח|שח", lowered)
         or re.search(r"\b\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\b", lowered)
         or parse_category_reply(text)
+    )
+
+
+def _has_manual_detail_fields(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"\b(amount|total|vendor|merchant|store|supplier|date|description|desc|details|currency)\s*[:\-]",
+            text,
+            re.IGNORECASE,
+        )
     )
 
 

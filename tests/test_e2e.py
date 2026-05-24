@@ -120,6 +120,67 @@ async def test_awaiting_category_to_confirmation(redis_client, mock_whatsapp, te
     assert state.state == "AWAITING_CONFIRMATION"
 
 
+async def test_awaiting_category_accepts_full_manual_details(redis_client, mock_whatsapp, test_db):
+    import app.main as main_module
+    from app.api.webhook import handle_incoming_message
+
+    main_module.redis_client = redis_client
+    fsm = ConversationFSM(redis_client)
+    await fsm.set_state("972501234567", ConversationState(state="AWAITING_CATEGORY", phone="972501234567", expense_data={"description": "old"}))
+    await handle_incoming_message(
+        "972501234567",
+        "Amount: 250 NIS\nVendor: Cafe Aroma\nDate: 2026-05-25\nCategory: Meals\nDescription: Team lunch",
+        False,
+        None,
+        "SM_manual_full",
+        test_db,
+    )
+    state = await fsm.get_state("972501234567")
+    assert state.state == "AWAITING_CONFIRMATION"
+    assert state.expense_data["amount"] == 250.0
+    assert state.expense_data["vendor"] == "Cafe Aroma"
+    assert state.expense_data["expense_date"] == "2026-05-25"
+    assert state.expense_data["category"] == "Meals"
+    assert state.expense_data["description"] == "Team lunch"
+
+
+async def test_awaiting_confirmation_accepts_full_manual_correction(redis_client, mock_whatsapp, test_db):
+    import app.main as main_module
+    from app.api.webhook import handle_incoming_message
+
+    main_module.redis_client = redis_client
+    fsm = ConversationFSM(redis_client)
+    await fsm.set_state(
+        "972501234567",
+        ConversationState(
+            state="AWAITING_CONFIRMATION",
+            phone="972501234567",
+            expense_data={
+                "amount": 100.0,
+                "currency": "NIS",
+                "vendor": "Old Vendor",
+                "expense_date": "2026-05-24",
+                "category": "Other",
+                "description": "old",
+            },
+        ),
+    )
+    await handle_incoming_message(
+        "972501234567",
+        "Amount: 250 NIS Vendor: Cafe Aroma Date: 2026-05-25 Category: Meals Description: Team lunch",
+        False,
+        None,
+        "SM_manual_correction",
+        test_db,
+    )
+    state = await fsm.get_state("972501234567")
+    assert state.state == "AWAITING_CONFIRMATION"
+    assert state.expense_data["amount"] == 250.0
+    assert state.expense_data["vendor"] == "Cafe Aroma"
+    assert state.expense_data["expense_date"] == "2026-05-25"
+    assert state.expense_data["category"] == "Meals"
+
+
 async def test_receipt_received_processes_new_image(redis_client, mock_whatsapp, test_db, mocker):
     import app.main as main_module
     from app.api.webhook import handle_incoming_message
