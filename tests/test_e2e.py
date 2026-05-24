@@ -21,7 +21,7 @@ async def test_image_message_transitions_to_ocr_state(client, twilio_form_params
     params = twilio_form_params(has_media=True, media_url="https://api.twilio.com/test.jpg")
     resp = await client.post("/webhook/twilio", data=params, headers=twilio_headers(params))
     assert resp.status_code == 200
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.25)
     assert mock_whatsapp.called
 
 
@@ -36,6 +36,7 @@ async def test_hebrew_text_detected(client, twilio_form_params, twilio_headers, 
     await client.post("/webhook/twilio", data=params, headers=twilio_headers(params))
     import app.main as main_module
 
+    await asyncio.sleep(0.25)
     state = await ConversationFSM(main_module.redis_client).get_state("972501234567")
     assert state.lang == "he"
 
@@ -56,6 +57,7 @@ async def test_low_confidence_ocr_triggers_manual_flow(client, twilio_form_param
     )
     params = twilio_form_params(has_media=True, media_url="https://api.twilio.com/test.jpg")
     await client.post("/webhook/twilio", data=params, headers=twilio_headers(params))
+    await asyncio.sleep(0.25)
     assert mock_whatsapp.call_count >= 2
 
 

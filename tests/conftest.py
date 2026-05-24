@@ -90,6 +90,8 @@ async def client(test_db, redis_client):
     import app.main as main_module
 
     main_module.redis_client = redis_client
+    app.state.run_webhook_tasks_inline = True
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
+    app.state.run_webhook_tasks_inline = False
     app.dependency_overrides.clear()

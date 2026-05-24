@@ -1,14 +1,15 @@
 import logging
 import re
 import uuid
+import asyncio
 from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.fsm.conversation import ConversationFSM
-from app.models.database import get_db
+from app.models.database import AsyncSessionLocal, get_db
 from app.models.employee import get_employee_by_phone
 from app.models.expense import create_expense, list_all_expenses, update_expense
 from app.models.schemas import ConversationState
@@ -34,7 +35,7 @@ def _wa_service() -> WhatsAppService:
 
 
 @router.post("/twilio")
-async def twilio_webhook(request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def twilio_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     form_data = dict(await request.form())
     wa = _wa_service()
     signature = request.headers.get("X-Twilio-Signature", "")
@@ -51,16 +52,23 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks, db
         logger.info("Duplicate SID %s from ...%s skipped", parsed["message_sid"], phone[-4:])
         return Response(content=EMPTY_TWIML, media_type="application/xml")
     await fsm.mark_message_processed(phone, parsed["message_sid"])
-    background_tasks.add_task(
-        handle_incoming_message,
-        phone=phone,
-        body=parsed["body"],
-        has_media=parsed["has_media"],
-        media_url=parsed["media_url"],
-        message_sid=parsed["message_sid"],
-        db=db,
+    task_coro = _handle_incoming_message_detached(
+            phone=phone,
+            body=parsed["body"],
+            has_media=parsed["has_media"],
+            media_url=parsed["media_url"],
+            message_sid=parsed["message_sid"],
     )
+    if getattr(request.app.state, "run_webhook_tasks_inline", False):
+        await task_coro
+    else:
+        asyncio.create_task(task_coro)
     return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+
+async def _handle_incoming_message_detached(phone, body, has_media, media_url, message_sid):
+    async with AsyncSessionLocal() as db:
+        await handle_incoming_message(phone, body, has_media, media_url, message_sid, db)
 
 
 async def handle_incoming_message(phone, body, has_media, media_url, message_sid, db):
@@ -90,6 +98,8 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
                 await fsm.transition(phone, "RECEIPT_RECEIVED")
                 await wa.send_message(f"whatsapp:+{phone}", render_template("receipt_received", lang))
                 await _process_receipt(phone, media_url, body_clean, db, fsm, wa, lang)
+            elif _looks_like_expense_text(body_clean):
+                await _process_manual_details(phone, body_clean, state.expense_data or {}, db, fsm, wa, lang)
             else:
                 await wa.send_message(f"whatsapp:+{phone}", render_template("welcome", lang))
         elif current == "AWAITING_CATEGORY":
@@ -108,29 +118,7 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
                     await fsm.transition(phone, "AWAITING_CATEGORY", retries=retries)
                     await wa.send_message(f"whatsapp:+{phone}", render_template("invalid_category", lang, category_menu=render_category_menu(lang)))
         elif current == "AWAITING_MANUAL_DETAILS":
-            parsed_details = await ReceiptOCRService().parse_manual_details(body_clean)
-            existing = state.expense_data or {}
-            merged = {**existing, **{k: v for k, v in parsed_details.items() if v is not None}}
-            merged["ocr_confidence"] = 0.8
-            category = merged.get("category") or merged.get("category_hint")
-            if category:
-                merged["category"] = category
-                await fsm.transition(phone, "AWAITING_CONFIRMATION", expense_data=merged, retries=0)
-                await wa.send_message(f"whatsapp:+{phone}", format_expense_summary(merged, lang))
-            else:
-                await fsm.transition(phone, "AWAITING_CATEGORY", expense_data=merged, retries=0)
-                await wa.send_message(
-                    f"whatsapp:+{phone}",
-                    render_template(
-                        "ocr_success_need_category",
-                        lang,
-                        amount=merged.get("amount", "?"),
-                        currency=merged.get("currency", "NIS"),
-                        vendor=merged.get("vendor", "?"),
-                        expense_date=merged.get("expense_date", "?"),
-                        category_menu=render_category_menu(lang),
-                    ),
-                )
+            await _process_manual_details(phone, body_clean, state.expense_data or {}, db, fsm, wa, lang)
         elif current == "AWAITING_CONFIRMATION":
             decision = parse_confirmation_reply(body_clean)
             if decision == "confirm":
@@ -144,11 +132,7 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
             else:
                 await wa.send_message(f"whatsapp:+{phone}", format_expense_summary(state.expense_data or {}, lang))
         elif current == "AWAITING_CORRECTION":
-            corrected = await ReceiptOCRService().parse_manual_details(body_clean)
-            existing = state.expense_data or {}
-            merged = {**existing, **{k: v for k, v in corrected.items() if v is not None}}
-            if merged.get("category_hint") and not merged.get("category"):
-                merged["category"] = merged["category_hint"]
+            merged = await _merge_manual_details(body_clean, state.expense_data or {})
             await fsm.transition(phone, "AWAITING_CONFIRMATION", expense_data=merged, retries=0)
             await wa.send_message(f"whatsapp:+{phone}", format_expense_summary(merged, lang))
         elif current in ("PROCESSING", "UPLOADING_TO_PRIORITY", "PENDING_APPROVAL"):
@@ -213,6 +197,48 @@ async def _process_receipt(phone, media_url, caption, db, fsm, wa, lang):
         logger.error("Unexpected error in _process_receipt: %s", exc, exc_info=True)
         await fsm.transition(phone, "AWAITING_MANUAL_DETAILS", retries=0)
         await wa.send_message(f"whatsapp:+{phone}", render_template("ocr_low_confidence", lang))
+
+
+def _looks_like_expense_text(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return bool(
+        re.search(r"\b(amount|total|vendor|merchant|date|category|description|nis|ils|usd|eur|gbp)\b|₪|ש\"ח|שח", lowered)
+        or re.search(r"\b\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\b", lowered)
+        or parse_category_reply(text)
+    )
+
+
+async def _merge_manual_details(body_clean: str, existing: dict) -> dict:
+    parsed_details = await ReceiptOCRService().parse_manual_details(body_clean)
+    merged = {**existing, **{key: value for key, value in parsed_details.items() if value is not None}}
+    category = merged.get("category") or merged.get("category_hint")
+    if category:
+        merged["category"] = category
+    merged["ocr_confidence"] = parsed_details.get("confidence", {}).get("overall", merged.get("ocr_confidence", 0.75))
+    return merged
+
+
+async def _process_manual_details(phone, body_clean, existing, db, fsm, wa, lang):
+    merged = await _merge_manual_details(body_clean, existing)
+    if not merged.get("category"):
+        await fsm.transition(phone, "AWAITING_CATEGORY", expense_data=merged, retries=0)
+        await wa.send_message(
+            f"whatsapp:+{phone}",
+            render_template(
+                "ocr_success_need_category",
+                lang,
+                amount=merged.get("amount", "?"),
+                currency=merged.get("currency", "NIS"),
+                vendor=merged.get("vendor", "?"),
+                expense_date=merged.get("expense_date", "?"),
+                category_menu=render_category_menu(lang),
+            ),
+        )
+        return
+    await fsm.transition(phone, "AWAITING_CONFIRMATION", expense_data=merged, retries=0)
+    await wa.send_message(f"whatsapp:+{phone}", format_expense_summary(merged, lang))
 
 
 async def _submit_expense(phone, state, db, fsm, wa):
