@@ -102,6 +102,14 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
                 await _process_manual_details(phone, body_clean, state.expense_data or {}, db, fsm, wa, lang)
             else:
                 await wa.send_message(f"whatsapp:+{phone}", render_template("welcome", lang))
+        elif current == "RECEIPT_RECEIVED":
+            if has_media:
+                await wa.send_message(f"whatsapp:+{phone}", render_template("receipt_received", lang))
+                await _process_receipt(phone, media_url, body_clean, db, fsm, wa, lang)
+            elif _looks_like_expense_text(body_clean):
+                await _process_manual_details(phone, body_clean, state.expense_data or {}, db, fsm, wa, lang)
+            else:
+                await wa.send_message(f"whatsapp:+{phone}", render_template("waiting", lang))
         elif current == "AWAITING_CATEGORY":
             category = parse_category_reply(body_clean)
             if category:
@@ -138,6 +146,10 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
         elif current in ("PROCESSING", "UPLOADING_TO_PRIORITY", "PENDING_APPROVAL"):
             await wa.send_message(f"whatsapp:+{phone}", render_template("waiting", lang))
         elif current in ("COMPLETED", "REJECTED", "PRIORITY_UPLOAD_FAILED"):
+            await fsm.reset(phone)
+            await wa.send_message(f"whatsapp:+{phone}", render_template("welcome", lang))
+        else:
+            logger.warning("Resetting unknown FSM state %s for ...%s", current, phone[-4:])
             await fsm.reset(phone)
             await wa.send_message(f"whatsapp:+{phone}", render_template("welcome", lang))
     except Exception as exc:

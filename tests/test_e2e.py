@@ -120,6 +120,57 @@ async def test_awaiting_category_to_confirmation(redis_client, mock_whatsapp, te
     assert state.state == "AWAITING_CONFIRMATION"
 
 
+async def test_receipt_received_processes_new_image(redis_client, mock_whatsapp, test_db, mocker):
+    import app.main as main_module
+    from app.api.webhook import handle_incoming_message
+
+    main_module.redis_client = redis_client
+    mocker.patch(
+        "app.services.ocr.ReceiptOCRService.extract_from_url",
+        return_value={
+            "amount": 250.0,
+            "currency": "NIS",
+            "vendor": "Cafe Aroma",
+            "expense_date": "2026-05-24",
+            "category_hint": "Meals",
+            "description": "Team lunch",
+            "raw_text_summary": "Test receipt",
+            "confidence": {"overall": 0.95, "amount": 0.98, "vendor": 0.92, "date": 0.90, "category": 0.88},
+        },
+    )
+    fsm = ConversationFSM(redis_client)
+    await fsm.set_state("972501234567", ConversationState(state="RECEIPT_RECEIVED", phone="972501234567"))
+    await handle_incoming_message("972501234567", "", True, "https://api.twilio.com/test.jpg", "SM_x", test_db)
+    state = await fsm.get_state("972501234567")
+    assert state.state == "AWAITING_CONFIRMATION"
+    assert state.expense_data["vendor"] == "Cafe Aroma"
+
+
+async def test_receipt_received_accepts_manual_details(redis_client, mock_whatsapp, test_db, mocker):
+    import app.main as main_module
+    from app.api.webhook import handle_incoming_message
+
+    main_module.redis_client = redis_client
+    mocker.patch(
+        "app.services.ocr.ReceiptOCRService.parse_manual_details",
+        return_value={
+            "amount": 250.0,
+            "currency": "NIS",
+            "vendor": "Cafe Aroma",
+            "expense_date": "2026-05-24",
+            "category": "Meals",
+            "description": "Team lunch",
+            "confidence": {"overall": 0.8},
+        },
+    )
+    fsm = ConversationFSM(redis_client)
+    await fsm.set_state("972501234567", ConversationState(state="RECEIPT_RECEIVED", phone="972501234567"))
+    await handle_incoming_message("972501234567", "amount 250 nis meals", False, None, "SM_x", test_db)
+    state = await fsm.get_state("972501234567")
+    assert state.state == "AWAITING_CONFIRMATION"
+    assert state.expense_data["category"] == "Meals"
+
+
 async def test_awaiting_confirmation_cancel(redis_client, mock_whatsapp, test_db):
     import app.main as main_module
     from app.api.webhook import handle_incoming_message
