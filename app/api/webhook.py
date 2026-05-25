@@ -43,6 +43,7 @@ UNSUPPORTED_TYPES = {
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
 RESTARTABLE_STATES = {"AWAITING_CATEGORY", "AWAITING_MANUAL_DETAILS", "AWAITING_CONFIRMATION", "AWAITING_CORRECTION", "RECEIPT_RECEIVED"}
 BUSY_STATES = {"PROCESSING", "UPLOADING_TO_PRIORITY", "PENDING_APPROVAL"}
+HEBREW_DETAIL_LABELS = r"סכום|סה[\"״']?כ(?:\s+לתשלום)?|לתשלום|ספק|בית\s+עסק|תאריך|קטגוריה|תיאור"
 
 
 def _wa_service() -> WhatsAppService:
@@ -211,7 +212,17 @@ async def handle_incoming_message(phone, body, has_media, media_url, message_sid
             else:
                 await safe_send(wa, f"whatsapp:+{phone}", format_expense_summary(state.expense_data or {}, lang))
         elif current == "AWAITING_CORRECTION":
-            merged = await _merge_manual_details(body_clean, state.expense_data or {})
+            existing = state.expense_data or {}
+            if _needs_vendor_english(existing) and not _has_manual_detail_fields(body_clean):
+                merged = {**existing, "vendor": sanitize_text(body_clean, MAX_VENDOR_LENGTH)}
+            else:
+                merged = await _merge_manual_details(body_clean, existing)
+            guard = _dashboard_english_guard(merged)
+            if not guard["clean"]:
+                _lower_expense_confidence(merged)
+                await fsm.transition(phone, "AWAITING_CORRECTION", expense_data=merged, retries=0)
+                await _send_vendor_english_required(phone, merged, wa, lang)
+                return
             await fsm.transition(phone, "AWAITING_CONFIRMATION", expense_data=merged, retries=0)
             await safe_send(wa, f"whatsapp:+{phone}", format_expense_summary(merged, lang))
         elif current in ("PROCESSING", "UPLOADING_TO_PRIORITY", "PENDING_APPROVAL"):
@@ -244,17 +255,27 @@ async def _process_receipt(phone, media_url, caption, db, fsm, wa, lang):
             await fsm.transition(phone, "AWAITING_MANUAL_DETAILS", retries=0)
             await safe_send(wa, f"whatsapp:+{phone}", render_template("ocr_low_confidence", lang))
             return
-        result = await ReceiptOCRService().extract_from_url(media_url, _wa_service())
+        ocr_service = ReceiptOCRService()
+        result = await ocr_service.extract_from_url(media_url, _wa_service())
+        caption_text = sanitize_text(caption, MAX_DESCRIPTION_LENGTH)
+        description = await _choose_receipt_description(ocr_service, caption_text, result)
         expense_data = {
             "amount": result.get("amount"),
             "currency": result.get("currency") or "NIS",
             "vendor": result.get("vendor"),
             "expense_date": result.get("expense_date"),
             "category": None,
-            "description": sanitize_text(caption, MAX_DESCRIPTION_LENGTH) or result.get("description"),
-            "caption": sanitize_text(caption, MAX_DESCRIPTION_LENGTH),
+            "description": description,
+            "caption": caption_text,
+            "source_language": result.get("source_language"),
             "ocr_confidence": result["confidence"]["overall"],
         }
+        guard = _dashboard_english_guard(expense_data)
+        if not guard["clean"]:
+            _lower_expense_confidence(expense_data)
+            await fsm.transition(phone, "AWAITING_CORRECTION", expense_data=expense_data, image_url=media_url, retries=0)
+            await _send_vendor_english_required(phone, expense_data, wa, lang)
+            return
         overall_conf = result["confidence"]["overall"]
         category_conf = result["confidence"].get("category", 0.0)
         category_hint = result.get("category_hint")
@@ -295,7 +316,7 @@ def _looks_like_expense_text(text: str) -> bool:
         return False
     lowered = text.lower()
     return bool(
-        re.search(r"\b(amount|total|vendor|merchant|date|category|description|nis|ils|usd|eur|gbp)\b|₪|ש\"ח|שח", lowered)
+        re.search(rf"\b(amount|total|sum|vendor|merchant|store|supplier|date|category|description|nis|ils|usd|eur|gbp)\b|₪|ש\"ח|ש״ח|שח|{HEBREW_DETAIL_LABELS}", lowered)
         or re.search(r"\b\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\b", lowered)
         or parse_category_reply(text)
     )
@@ -306,7 +327,7 @@ def _has_manual_detail_fields(text: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(amount|total|vendor|merchant|store|supplier|date|description|desc|details|currency)\s*[:\-]",
+            rf"\b(amount|total|sum|vendor|merchant|store|supplier|date|category|description|desc|details|currency)\s*[:\-]|{HEBREW_DETAIL_LABELS}\s*[:\-]?",
             text,
             re.IGNORECASE,
         )
@@ -323,8 +344,35 @@ async def _merge_manual_details(body_clean: str, existing: dict) -> dict:
     return merged
 
 
+async def _choose_receipt_description(ocr_service: ReceiptOCRService, caption_text: str | None, result: dict) -> str | None:
+    ocr_description = result.get("description")
+    overall_conf = (result.get("confidence") or {}).get("overall", 0.0)
+    try:
+        overall_conf = float(overall_conf)
+    except (TypeError, ValueError):
+        overall_conf = 0.0
+
+    if caption_text and not ocr_service._contains_hebrew(caption_text):
+        return caption_text
+    if ocr_description and not ocr_service._contains_hebrew(ocr_description) and overall_conf >= 0.6:
+        return ocr_description
+    if caption_text and ocr_service._contains_hebrew(caption_text):
+        translated_caption = await ocr_service.translate_description_to_english(caption_text)
+        if translated_caption:
+            return translated_caption
+    if ocr_description and not ocr_service._contains_hebrew(ocr_description):
+        return ocr_description
+    return None
+
+
 async def _process_manual_details(phone, body_clean, existing, db, fsm, wa, lang):
     merged = await _merge_manual_details(body_clean, existing)
+    guard = _dashboard_english_guard(merged)
+    if not guard["clean"]:
+        _lower_expense_confidence(merged)
+        await fsm.transition(phone, "AWAITING_CORRECTION", expense_data=merged, retries=0)
+        await _send_vendor_english_required(phone, merged, wa, lang)
+        return
     if not merged.get("category"):
         await fsm.transition(phone, "AWAITING_CATEGORY", expense_data=merged, retries=0)
         await safe_send(wa, 
@@ -349,6 +397,12 @@ async def _submit_expense(phone, state, db, fsm, wa):
 
     expense_data = state.expense_data or {}
     lang = state.lang
+    guard = _dashboard_english_guard(expense_data)
+    if not guard["clean"]:
+        _lower_expense_confidence(expense_data)
+        await fsm.transition(phone, "AWAITING_CORRECTION", expense_data=expense_data, retries=0)
+        await _send_vendor_english_required(phone, expense_data, wa, lang)
+        return
     missing = _validate_expense_data_complete(expense_data)
     if missing:
         await fsm.transition(phone, "AWAITING_MANUAL_DETAILS", expense_data=expense_data, retries=0)
@@ -392,7 +446,7 @@ async def _submit_expense(phone, state, db, fsm, wa):
             "cost_center": cost_center,
             "receipt_image_url": state.image_url,
             "ocr_confidence": expense_data.get("ocr_confidence", 0.0),
-            "language": lang,
+            "language": expense_data.get("source_language") or lang,
         },
     )
     await fsm.transition(phone, "PROCESSING", pending_expense_id=expense.id)
@@ -414,6 +468,32 @@ def _validate_expense_data_complete(expense_data: dict) -> list[str]:
     if not expense_data.get("expense_date"):
         errors.append("expense_date")
     return errors
+
+
+def _dashboard_english_guard(expense_data: dict) -> dict:
+    guard = ReceiptOCRService().dashboard_english_guard(expense_data or {})
+    if expense_data is not None:
+        expense_data.clear()
+        expense_data.update(guard["expense_data"])
+        guard["expense_data"] = expense_data
+    return guard
+
+
+def _needs_vendor_english(expense_data: dict) -> bool:
+    return not _dashboard_english_guard({**(expense_data or {})})["clean"]
+
+
+async def _send_vendor_english_required(phone: str, expense_data: dict, wa, lang: str) -> None:
+    vendor = expense_data.get("vendor") or "this vendor"
+    await safe_send(wa, f"whatsapp:+{phone}", render_template("vendor_english_required", lang, vendor=vendor))
+
+
+def _lower_expense_confidence(expense_data: dict) -> None:
+    try:
+        current = float(expense_data.get("ocr_confidence", 0.35))
+    except (TypeError, ValueError):
+        current = 0.35
+    expense_data["ocr_confidence"] = min(current, 0.35)
 
 
 async def handle_manager_reply(phone, action, expense_id_prefix, db, fsm, wa, lang):

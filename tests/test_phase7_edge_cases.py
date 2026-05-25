@@ -87,6 +87,54 @@ async def test_image_with_caption_stores_caption_as_description(client, twilio_f
     assert state.expense_data["description"] == "Team lunch caption"
 
 
+async def test_hebrew_image_caption_does_not_override_translated_description(client, twilio_form_params, twilio_headers, mock_whatsapp, mocker):
+    mocker.patch(
+        "app.services.ocr.ReceiptOCRService.extract_from_url",
+        return_value={
+            "amount": 250,
+            "currency": "NIS",
+            "vendor": "Cafe Aroma",
+            "expense_date": "2026-05-24",
+            "category_hint": "Meals",
+            "description": "Team lunch",
+            "raw_text_summary": "receipt",
+            "source_language": "he",
+            "confidence": {"overall": 0.95, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        },
+    )
+    params = twilio_form_params(body="ארוחת צוות", has_media=True, media_url="https://api.twilio.com/test.jpg")
+    await client.post("/webhook/twilio", data=params, headers=twilio_headers(params))
+    from app.main import redis_client
+
+    state = await ConversationFSM(redis_client).get_state("972501234567")
+    assert state.expense_data["description"] == "Team lunch"
+    assert state.expense_data["source_language"] == "he"
+
+
+async def test_hebrew_image_caption_is_transliterated_when_ocr_description_missing(client, twilio_form_params, twilio_headers, mock_whatsapp, mocker):
+    mocker.patch(
+        "app.services.ocr.ReceiptOCRService.extract_from_url",
+        return_value={
+            "amount": 250,
+            "currency": "NIS",
+            "vendor": "Cafe Aroma",
+            "expense_date": "2026-05-24",
+            "category_hint": "Meals",
+            "description": None,
+            "raw_text_summary": "receipt",
+            "source_language": "he",
+            "confidence": {"overall": 0.95, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        },
+    )
+    mocker.patch("app.services.ocr.ReceiptOCRService.translate_description_to_english", return_value="Team meal")
+    params = twilio_form_params(body="ארוחת צוות", has_media=True, media_url="https://api.twilio.com/test.jpg")
+    await client.post("/webhook/twilio", data=params, headers=twilio_headers(params))
+    from app.main import redis_client
+
+    state = await ConversationFSM(redis_client).get_state("972501234567")
+    assert state.expense_data["description"] == "Team meal"
+
+
 async def test_null_media_url_falls_back_to_manual(client, twilio_form_params, twilio_headers, mock_whatsapp):
     params = twilio_form_params(has_media=True, media_url=None)
     params["NumMedia"] = "1"
@@ -274,6 +322,20 @@ async def test_duplicate_expense_detected_and_blocked(test_db):
         "expense_date": "2026-05-24",
     })
     duplicate = await find_potential_duplicate(test_db, "972501234567", 250, None, "2026-05-24", "Meals")
+    assert duplicate.id == expense.id
+
+
+async def test_duplicate_expense_vendor_match_is_case_insensitive(test_db):
+    expense = await create_expense(test_db, {
+        "whatsapp_number": "972501234567",
+        "amount": 250,
+        "currency": "NIS",
+        "amount_nis": 250,
+        "vendor": "Cafe Aroma",
+        "category": "Meals",
+        "expense_date": "2026-05-24",
+    })
+    duplicate = await find_potential_duplicate(test_db, "972501234567", 250, "cafe aroma", "2026-05-24", "Meals")
     assert duplicate.id == expense.id
 
 

@@ -18,7 +18,40 @@ PRIMARY_MODEL = "gemini-3-flash-preview"
 FALLBACK_MODEL = "gemini-3.1-flash-lite"
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-CURRENCY_SYMBOLS = {"₪": "NIS", "ILS": "NIS", "NIS": "NIS", "$": "USD", "€": "EUR", "£": "GBP", "USD": "USD", "EUR": "EUR", "GBP": "GBP"}
+CURRENCY_SYMBOLS = {"₪": "NIS", "ש\"ח": "NIS", "ש״ח": "NIS", "שח": "NIS", "ILS": "NIS", "NIS": "NIS", "$": "USD", "€": "EUR", "£": "GBP", "USD": "USD", "EUR": "EUR", "GBP": "GBP"}
+FIELD_LABELS = {
+    "amount": "amount",
+    "total": "amount",
+    "sum": "amount",
+    "grand total": "amount",
+    "amount due": "amount",
+    "סכום": "amount",
+    "סהכ": "amount",
+    "סהכ לתשלום": "amount",
+    "לתשלום": "amount",
+    "vendor": "vendor",
+    "merchant": "vendor",
+    "store": "vendor",
+    "supplier": "vendor",
+    "ספק": "vendor",
+    "בית עסק": "vendor",
+    "date": "expense_date",
+    "receipt date": "expense_date",
+    "transaction date": "expense_date",
+    "תאריך": "expense_date",
+    "category": "category",
+    "קטגוריה": "category",
+    "description": "description",
+    "desc": "description",
+    "details": "description",
+    "תיאור": "description",
+    "currency": "currency",
+}
+FIELD_LABEL_RE = r"\b(?:amount due|grand total|receipt date|transaction date|amount|total|sum|vendor|merchant|store|supplier|date|category|description|desc|details|currency)\b|סה[\"״']?כ(?:\s+לתשלום)?|לתשלום|סכום|בית\s+עסק|ספק|תאריך|קטגוריה|תיאור"
+HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
+DASHBOARD_BLOCKING_ENGLISH_FIELDS = ("vendor",)
+DASHBOARD_OPTIONAL_ENGLISH_FIELDS = ("description",)
+TRANSLATABLE_DASHBOARD_FIELDS = ("vendor", "category", "category_hint", "description")
 
 CANONICAL_CATEGORIES = [
     "Meals",
@@ -40,6 +73,7 @@ RECEIPT_SCHEMA = {
         "expense_date": {"type": ["string", "null"]},
         "category_hint": {"type": ["string", "null"], "enum": CANONICAL_CATEGORIES + [None]},
         "description": {"type": ["string", "null"]},
+        "source_language": {"type": ["string", "null"], "enum": ["en", "he", "unknown", None]},
         "confidence": {
             "type": "object",
             "properties": {
@@ -65,6 +99,7 @@ MANUAL_SCHEMA = {
         "expense_date": {"type": ["string", "null"]},
         "category": {"type": ["string", "null"], "enum": CANONICAL_CATEGORIES + [None]},
         "description": {"type": ["string", "null"]},
+        "source_language": {"type": ["string", "null"], "enum": ["en", "he", "unknown", None]},
     },
     "required": ["amount", "currency", "vendor", "expense_date", "category", "description"],
 }
@@ -73,12 +108,27 @@ EXTRACTION_USER_PROMPT = """You are a receipt OCR specialist for an Israeli expe
 Extract structured expense data from this receipt image. Receipts may be in Hebrew or English.
 Return JSON only. Do not guess invisible fields. Prefer the receipt grand total/net total/final total.
 Normalize dates to YYYY-MM-DD. Default currency to NIS if the receipt uses shekel symbols, ILS, NIS, Hebrew text, or Israeli context.
-Category must be one of: Meals, Travel, Accommodation, Entertainment, Office Supplies, Software, Conference, Other."""
+Category must be one of: Meals, Travel, Accommodation, Entertainment, Office Supplies, Software, Conference, Other.
+For dashboard fields, return English only:
+- Translate Hebrew vendor names to their common English name when obvious, otherwise transliterate the business name without inventing a different company.
+- Translate description and raw_text_summary into concise business English.
+- Do not return Hebrew characters in vendor, description, category_hint, or raw_text_summary.
+Set source_language to "he" for Hebrew receipts, "en" for English receipts, or "unknown" if unclear."""
 
 MANUAL_PARSE_PROMPT = """Extract expense details from this employee text.
 Today's date is {today}. "yesterday" = {yesterday}. "last week" = {last_week}.
-Return JSON only using canonical categories.
+Return JSON only using canonical categories. Translate Hebrew text to English for vendor and description.
+Preserve business names by using their common English spelling when obvious, otherwise transliterate.
+Do not return Hebrew characters in vendor, description, or category.
 Text: {text!r}"""
+
+DESCRIPTION_TRANSLITERATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {"type": ["string", "null"]},
+    },
+    "required": ["description"],
+}
 
 
 class ReceiptExtractionError(Exception):
@@ -91,7 +141,8 @@ class ReceiptOCRService:
         raw = await self._call_gemini_json(EXTRACTION_USER_PROMPT, RECEIPT_SCHEMA, image_bytes=image_bytes)
         if raw is None:
             raise ReceiptExtractionError("Gemini did not return valid receipt JSON")
-        return self._validate_and_normalize(raw)
+        normalized = self._validate_and_normalize(raw)
+        return self._apply_dashboard_english_guard(normalized)
 
     async def extract_from_url(self, media_url: str, whatsapp_service) -> dict:
         image_bytes = await whatsapp_service.download_media(media_url)
@@ -99,7 +150,7 @@ class ReceiptOCRService:
 
     async def parse_manual_details(self, text: str) -> dict:
         local = self._parse_manual_locally(text)
-        if self._manual_is_complete(local):
+        if self._manual_is_complete(local) and not self._needs_english_translation(local):
             local["confidence"] = {"overall": 0.9}
             return self._validate_and_normalize(local)
 
@@ -118,12 +169,36 @@ class ReceiptOCRService:
         merged = {**local}
         if isinstance(model_result, dict):
             for key, value in model_result.items():
-                if value is not None and not merged.get(key):
+                if value is None:
+                    continue
+                if not merged.get(key) or (key in {"vendor", "description", "category", "category_hint"} and self._contains_hebrew(merged.get(key))):
                     merged[key] = value
         merged.setdefault("description", text)
         merged.setdefault("currency", "NIS")
         merged.setdefault("confidence", {"overall": 0.75 if self._manual_is_usable(merged) else 0.35})
-        return self._validate_and_normalize(merged)
+        normalized = self._validate_and_normalize(merged)
+        return self._apply_dashboard_english_guard(normalized)
+
+    async def translate_description_to_english(self, text: str) -> str | None:
+        if not text:
+            return None
+        if not self._contains_hebrew(text):
+            return text
+        prompt = (
+            "Translate or transliterate this employee-provided expense description to concise business English. "
+            "Return JSON only. Do not add details that are not present. "
+            f"Description: {text!r}"
+        )
+        try:
+            translated = await self._call_gemini_json(prompt, DESCRIPTION_TRANSLITERATION_SCHEMA)
+        except Exception:
+            return None
+        if not isinstance(translated, dict):
+            return None
+        description = self._clean_labeled_value(translated.get("description"), "description")
+        if not description or self._contains_hebrew(description):
+            return None
+        return str(description)
 
     async def _call_gemini_json(self, prompt: str, schema: dict, image_bytes: bytes | None = None, max_retries: int = 3) -> dict | None:
         def _run_sync() -> dict | None:
@@ -248,11 +323,11 @@ class ReceiptOCRService:
         }
         normalized = text.strip()
         lower = normalized.lower()
-        labels = r"amount|total|sum|vendor|merchant|store|supplier|date|category|description|desc|details|currency"
+        labels = FIELD_LABEL_RE
 
         def field_value(label_pattern: str) -> str | None:
             match = re.search(
-                rf"(?:{label_pattern})\s*[:\-]\s*(.*?)(?=\s+(?:{labels})\s*[:\-]|$)",
+                rf"(?:{label_pattern})\s*[:\-]?\s*(.*?)(?=\s+(?:{labels})\s*[:\-]?|$)",
                 normalized,
                 re.IGNORECASE | re.DOTALL,
             )
@@ -261,9 +336,9 @@ class ReceiptOCRService:
             value = " ".join(match.group(1).split()).strip(" ,;")
             return value or None
 
-        amount_match = re.search(r"(?:amount|total|sum|סכום)\s*[:\-]?\s*(?:₪|nis|ils|usd|eur|gbp)?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", lower, re.IGNORECASE)
+        amount_match = re.search(r"(?:amount due|grand total|amount|total|sum|סכום|סה[\"״']?כ(?:\s+לתשלום)?|לתשלום)\s*[:\-]?\s*(?:₪|ש\"ח|ש״ח|שח|nis|ils|usd|eur|gbp|\$|€|£)?\s*([0-9][0-9,]*(?:[.,][0-9]{1,2})?)", lower, re.IGNORECASE)
         if not amount_match:
-            money_match = re.search(r"(?:₪|nis|ils|usd|eur|gbp)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)|([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:₪|nis|ils|usd|eur|gbp)", lower, re.IGNORECASE)
+            money_match = re.search(r"(?:₪|ש\"ח|ש״ח|שח|nis|ils|usd|eur|gbp|\$|€|£)\s*([0-9][0-9,]*(?:[.,][0-9]{1,2})?)|([0-9][0-9,]*(?:[.,][0-9]{1,2})?)\s*(?:₪|ש\"ח|ש״ח|שח|nis|ils|usd|eur|gbp|\$|€|£)", lower, re.IGNORECASE)
             amount_match = money_match
         if not amount_match:
             amount_match = re.search(r"\b([0-9]{2,}[0-9,]*(?:\.[0-9]{1,2})?)\b", lower)
@@ -277,15 +352,15 @@ class ReceiptOCRService:
             data["currency"] = "EUR"
         elif re.search(r"\b(gbp|pound|pounds|£)\b", lower):
             data["currency"] = "GBP"
-        elif re.search(r"\b(nis|ils|shekel|shekels)\b|₪|ש\"ח|שח", lower):
+        elif re.search(r"\b(nis|ils|shekel|shekels)\b|₪|ש\"ח|ש״ח|שח", lower):
             data["currency"] = "NIS"
 
-        vendor_match = re.search(r"(?:vendor|merchant|store|supplier|ספק)\s*[:\-]\s*([^\n\r,]+)", normalized, re.IGNORECASE)
+        vendor_match = re.search(r"(?:vendor|merchant|store|supplier|ספק|בית\s+עסק)\s*[:\-]?\s*([^\n\r,]+)", normalized, re.IGNORECASE)
         if vendor_match:
             data["vendor"] = vendor_match.group(1).strip()
-        data["vendor"] = field_value(r"vendor|merchant|store|supplier") or data["vendor"]
+        data["vendor"] = field_value(r"vendor|merchant|store|supplier|ספק|בית\s+עסק") or data["vendor"]
 
-        date_match = re.search(r"(?:date|תאריך)\s*[:\-]\s*([0-9]{1,4}[./\-][0-9]{1,2}[./\-][0-9]{1,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", normalized, re.IGNORECASE)
+        date_match = re.search(r"(?:receipt date|transaction date|date|תאריך)\s*[:\-]?\s*([0-9]{1,4}[./\-][0-9]{1,2}[./\-][0-9]{1,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", normalized, re.IGNORECASE)
         if not date_match:
             date_match = re.search(r"\b([0-9]{4}[./\-][0-9]{1,2}[./\-][0-9]{1,2}|[0-9]{1,2}[./\-][0-9]{1,2}[./\-][0-9]{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b", normalized)
         if date_match:
@@ -295,10 +370,10 @@ class ReceiptOCRService:
         elif "today" in lower:
             data["expense_date"] = datetime.now().date().isoformat()
 
-        category_match = re.search(r"(?:category|קטגוריה)\s*[:\-]\s*([^\n\r,]+)", normalized, re.IGNORECASE)
+        category_match = re.search(r"(?:category|קטגוריה)\s*[:\-]?\s*([^\n\r,]+)", normalized, re.IGNORECASE)
         if category_match:
             data["category"] = parse_category_reply(category_match.group(1)) or category_match.group(1).strip()
-        category_field = field_value(r"category")
+        category_field = field_value(r"category|קטגוריה")
         if category_field:
             data["category"] = parse_category_reply(category_field) or category_field.strip()
         if not data["category"]:
@@ -308,12 +383,12 @@ class ReceiptOCRService:
                     data["category"] = category
                     break
 
-        description_match = re.search(r"(?:description|desc|details|תיאור)\s*[:\-]\s*([^\n\r]+)", normalized, re.IGNORECASE)
+        description_match = re.search(r"(?:description|desc|details|תיאור)\s*[:\-]?\s*([^\n\r]+)", normalized, re.IGNORECASE)
         if description_match:
             data["description"] = description_match.group(1).strip()
         else:
             data["description"] = normalized
-        data["description"] = field_value(r"description|desc|details") or data["description"]
+        data["description"] = field_value(r"description|desc|details|תיאור") or data["description"]
 
         return data
 
@@ -324,12 +399,21 @@ class ReceiptOCRService:
         return bool(data.get("amount") is not None or data.get("vendor") or data.get("expense_date") or data.get("category"))
 
     def _validate_and_normalize(self, raw: dict) -> dict:
+        raw = dict(raw)
+        self._repair_labeled_field_bleed(raw)
         if "category" in raw and "category_hint" not in raw:
             raw["category_hint"] = raw.get("category")
         if "category_hint" in raw and "category" not in raw:
             raw["category"] = raw.get("category_hint")
         for field in ["amount", "currency", "vendor", "expense_date", "category_hint", "description", "raw_text_summary"]:
             raw.setdefault(field, None)
+        raw.setdefault("source_language", None)
+        if not raw.get("source_language"):
+            raw["source_language"] = "he" if any(self._contains_hebrew(value) for value in raw.values()) else None
+        elif str(raw["source_language"]).lower() not in {"he", "en", "unknown"}:
+            raw["source_language"] = "he" if self._contains_hebrew(raw["source_language"]) else "unknown"
+        else:
+            raw["source_language"] = str(raw["source_language"]).lower()
 
         conf = raw.get("confidence") or {}
         if not isinstance(conf, dict):
@@ -342,6 +426,14 @@ class ReceiptOCRService:
             except (TypeError, ValueError):
                 conf[key] = 0.5
         raw["confidence"] = conf
+
+        raw["amount"] = self._clean_labeled_value(raw.get("amount"), "amount")
+        raw["currency"] = self._clean_labeled_value(raw.get("currency"), "currency")
+        raw["vendor"] = self._clean_labeled_value(raw.get("vendor"), "vendor")
+        raw["expense_date"] = self._clean_labeled_value(raw.get("expense_date"), "expense_date")
+        raw["category"] = self._clean_labeled_value(raw.get("category"), "category")
+        raw["category_hint"] = self._clean_labeled_value(raw.get("category_hint"), "category")
+        raw["description"] = self._clean_labeled_value(raw.get("description"), "description")
 
         currency_from_amount = self._currency_from_amount(raw.get("amount"))
         if raw.get("currency"):
@@ -357,6 +449,109 @@ class ReceiptOCRService:
         elif raw.get("category_hint"):
             raw["category_hint"] = parse_category_reply(str(raw["category_hint"])) or raw["category_hint"]
         return raw
+
+    def _contains_hebrew(self, value: Any) -> bool:
+        return bool(isinstance(value, str) and HEBREW_RE.search(value))
+
+    def dashboard_english_guard(self, expense_data: dict) -> dict:
+        guarded = dict(expense_data or {})
+        flagged_fields = []
+        for field in DASHBOARD_BLOCKING_ENGLISH_FIELDS:
+            if self._contains_hebrew(guarded.get(field)):
+                flagged_fields.append(field)
+        for field in DASHBOARD_OPTIONAL_ENGLISH_FIELDS:
+            if self._contains_hebrew(guarded.get(field)):
+                flagged_fields.append(field)
+                guarded[field] = None
+        required_flagged = [field for field in flagged_fields if field in DASHBOARD_BLOCKING_ENGLISH_FIELDS]
+        return {
+            "clean": not required_flagged,
+            "flagged_fields": flagged_fields,
+            "expense_data": guarded,
+        }
+
+    def dashboard_english_errors(self, data: dict) -> list[str]:
+        return self.dashboard_english_guard(data)["flagged_fields"]
+
+    def _needs_english_translation(self, data: dict) -> bool:
+        return any(self._contains_hebrew(data.get(field)) for field in TRANSLATABLE_DASHBOARD_FIELDS)
+
+    def _apply_dashboard_english_guard(self, data: dict) -> dict:
+        guard = self.dashboard_english_guard(data)
+        guarded = guard["expense_data"]
+        if not guard["clean"]:
+            self._lower_confidence(guarded)
+        return guarded
+
+    def _lower_confidence(self, data: dict, max_overall: float = 0.35) -> None:
+        conf = data.setdefault("confidence", {})
+        if not isinstance(conf, dict):
+            conf = {}
+            data["confidence"] = conf
+        try:
+            current = float(conf.get("overall", max_overall))
+        except (TypeError, ValueError):
+            current = max_overall
+        conf["overall"] = min(current, max_overall)
+
+    def _repair_labeled_field_bleed(self, raw: dict) -> None:
+        embedded: dict[str, str] = {}
+        for value in raw.values():
+            if isinstance(value, str):
+                embedded.update(self._extract_labeled_fields(value))
+
+        for field in ("amount", "currency", "vendor", "expense_date", "description"):
+            value = embedded.get(field)
+            if value and (not raw.get(field) or self._contains_field_label(raw.get(field))):
+                raw[field] = value
+
+        category = embedded.get("category")
+        if category:
+            for field in ("category", "category_hint"):
+                if not raw.get(field) or self._contains_field_label(raw.get(field)):
+                    raw[field] = category
+
+    def _extract_labeled_fields(self, text: str) -> dict[str, str]:
+        normalized = " ".join(str(text).split())
+        matches = list(re.finditer(rf"(?P<label>{FIELD_LABEL_RE})\s*[:\-]?\s*", normalized, re.IGNORECASE))
+        extracted: dict[str, str] = {}
+        for index, match in enumerate(matches):
+            canonical = self._canonical_field_label(match.group("label"))
+            if not canonical:
+                continue
+            next_start = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+            value = normalized[match.end():next_start].strip(" ,;|")
+            if value:
+                extracted[canonical] = value
+        return extracted
+
+    def _canonical_field_label(self, label: str) -> str | None:
+        cleaned = " ".join(str(label).lower().split())
+        cleaned = cleaned.replace("״", "").replace('"', "").replace("'", "")
+        return FIELD_LABELS.get(cleaned)
+
+    def _contains_field_label(self, value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        return bool(re.search(rf"\s+(?:{FIELD_LABEL_RE})\s*[:\-]?", value, re.IGNORECASE) or re.match(rf"^(?:{FIELD_LABEL_RE})\s*[:\-]?", value, re.IGNORECASE))
+
+    def _clean_labeled_value(self, value: Any, field: str | None = None) -> Any:
+        if value is None or isinstance(value, (int, float)):
+            return value
+        text = " ".join(str(value).split()).strip(" ,;|")
+        if not text:
+            return None
+
+        leading = re.match(rf"^(?P<label>{FIELD_LABEL_RE})\s*[:\-]?\s*(?P<value>.*)$", text, re.IGNORECASE)
+        if leading:
+            canonical = self._canonical_field_label(leading.group("label"))
+            if field is None or canonical == field or (field == "category" and canonical == "category"):
+                text = leading.group("value").strip(" ,;|")
+
+        boundary = re.search(rf"\s+(?:{FIELD_LABEL_RE})\s*[:\-]?", text, re.IGNORECASE)
+        if boundary:
+            text = text[:boundary.start()].strip(" ,;|")
+        return text or None
 
     def _normalize_date(self, date_str: str) -> str | None:
         from dateutil import parser as dateutil_parser
@@ -398,7 +593,7 @@ class ReceiptOCRService:
         text = str(raw).strip()
         if not text or text.lower() in {"n/a", "unknown", "none", "-", "—"}:
             return None
-        text = re.sub(r"(₪|â‚ª|\$|€|£|\bNIS\b|\bILS\b|\bUSD\b|\bEUR\b|\bGBP\b)", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"(₪|â‚ª|ש\"ח|ש״ח|שח|\$|€|£|\bNIS\b|\bILS\b|\bUSD\b|\bEUR\b|\bGBP\b)", "", text, flags=re.IGNORECASE).strip()
         text = text.replace(" ", "")
         if text.startswith("-"):
             return None

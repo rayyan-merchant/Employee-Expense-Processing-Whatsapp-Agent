@@ -1,7 +1,11 @@
 import asyncio
+import re
 
 from app.fsm.conversation import ConversationFSM
 from app.models.schemas import ConversationState
+
+
+HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
 
 
 async def test_image_message_transitions_to_ocr_state(client, twilio_form_params, twilio_headers, mock_whatsapp, mocker):
@@ -230,6 +234,100 @@ async def test_receipt_received_accepts_manual_details(redis_client, mock_whatsa
     state = await fsm.get_state("972501234567")
     assert state.state == "AWAITING_CONFIRMATION"
     assert state.expense_data["category"] == "Meals"
+
+
+async def test_hebrew_ocr_flow_submits_english_dashboard_fields(client, redis_client, test_db, mock_whatsapp, mocker):
+    import app.main as main_module
+    from app.api.webhook import handle_incoming_message
+
+    main_module.redis_client = redis_client
+    mocker.patch(
+        "app.services.ocr.ReceiptOCRService.extract_from_url",
+        return_value={
+            "amount": 80.0,
+            "currency": "NIS",
+            "vendor": "Cafe Aroma",
+            "expense_date": "2026-05-25",
+            "category_hint": "Meals",
+            "description": "Team meal",
+            "raw_text_summary": "Receipt from Cafe Aroma",
+            "source_language": "he",
+            "confidence": {"overall": 0.95, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        },
+    )
+    await handle_incoming_message("972501234567", "", True, "https://api.twilio.com/hebrew.jpg", "SM_hebrew_image", test_db)
+    await handle_incoming_message("972501234567", "1", False, None, "SM_hebrew_confirm", test_db)
+
+    expenses = (await client.get("/api/expenses")).json()
+    expense = expenses[0]
+    assert expense["vendor"] == "Cafe Aroma"
+    assert expense["category"] == "Meals"
+    assert expense["description"] == "Team meal"
+    assert expense["language"] == "he"
+    assert not HEBREW_RE.search(expense["vendor"])
+    assert not HEBREW_RE.search(expense["category"])
+    assert not HEBREW_RE.search(expense["description"])
+
+
+async def test_hebrew_ocr_untranslated_fields_route_to_manual(client, twilio_form_params, twilio_headers, mock_whatsapp, mocker):
+    mocker.patch(
+        "app.services.ocr.ReceiptOCRService.extract_from_url",
+        return_value={
+            "amount": 80.0,
+            "currency": "NIS",
+            "vendor": "קפה ארומה",
+            "expense_date": "2026-05-25",
+            "category_hint": "ארוחות",
+            "description": "ארוחת צוות",
+            "raw_text_summary": "קבלה",
+            "source_language": "he",
+            "confidence": {"overall": 0.95, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        },
+    )
+    image = twilio_form_params(has_media=True, media_url="https://api.twilio.com/hebrew.jpg", sid="SM_bad_hebrew_image")
+    await client.post("/webhook/twilio", data=image, headers=twilio_headers(image))
+    from app.main import redis_client
+
+    state = await ConversationFSM(redis_client).get_state("972501234567")
+    assert state.state == "AWAITING_CORRECTION"
+    assert state.expense_data["ocr_confidence"] == 0.35
+    assert (await client.get("/api/expenses")).json() == []
+
+
+async def test_confirmation_correction_can_replace_hebrew_fields(redis_client, mock_whatsapp, test_db):
+    import app.main as main_module
+    from app.api.webhook import handle_incoming_message
+
+    main_module.redis_client = redis_client
+    fsm = ConversationFSM(redis_client)
+    await fsm.set_state(
+        "972501234567",
+        ConversationState(
+            state="AWAITING_CONFIRMATION",
+            phone="972501234567",
+            lang="he",
+            expense_data={
+                "amount": 80.0,
+                "currency": "NIS",
+                "vendor": "קפה ארומה",
+                "expense_date": "2026-05-25",
+                "category": "Meals",
+                "description": "ארוחת צוות",
+            },
+        ),
+    )
+    await handle_incoming_message(
+        "972501234567",
+        "Amount: 80 NIS Vendor: Cafe Aroma Date: 2026-05-25 Category: Meals Description: Team meal",
+        False,
+        None,
+        "SM_hebrew_correction",
+        test_db,
+    )
+    state = await fsm.get_state("972501234567")
+    assert state.state == "AWAITING_CONFIRMATION"
+    assert state.expense_data["vendor"] == "Cafe Aroma"
+    assert state.expense_data["description"] == "Team meal"
 
 
 async def test_awaiting_confirmation_cancel(redis_client, mock_whatsapp, test_db):

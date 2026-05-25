@@ -138,6 +138,214 @@ async def test_parse_manual_single_line_labels_do_not_bleed(mocker):
     gemini.assert_not_called()
 
 
+async def test_parse_manual_hebrew_translates_dashboard_fields(mocker):
+    gemini = mocker.patch.object(
+        ReceiptOCRService,
+        "_call_gemini_json",
+        return_value={
+            "amount": 80,
+            "currency": "NIS",
+            "vendor": "Cafe Aroma",
+            "expense_date": "2026-05-25",
+            "category": "Meals",
+            "description": "Team meal",
+            "source_language": "he",
+        },
+    )
+
+    result = await ReceiptOCRService().parse_manual_details(
+        "סכום: 80 ש״ח ספק: קפה ארומה תאריך: 25/05/2026 קטגוריה: ארוחות תיאור: ארוחת צוות"
+    )
+
+    assert result["amount"] == 80.0
+    assert result["currency"] == "NIS"
+    assert result["vendor"] == "Cafe Aroma"
+    assert result["expense_date"] == "2026-05-25"
+    assert result["category"] == "Meals"
+    assert result["description"] == "Team meal"
+    assert result["source_language"] == "he"
+    gemini.assert_called_once()
+
+
+async def test_extract_hebrew_receipt_translates_dashboard_fields(mocker, sample_image_bytes):
+    gemini = mocker.patch.object(
+        ReceiptOCRService,
+        "_call_gemini_json",
+        return_value={
+            "amount": "80 ש״ח",
+            "currency": None,
+            "vendor": "Cafe Aroma",
+            "expense_date": "25/05/2026",
+            "category_hint": "Meals",
+            "description": "Team meal",
+            "raw_text_summary": "Receipt from Cafe Aroma",
+            "source_language": "he",
+            "confidence": {"overall": 0.94, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        },
+    )
+
+    result = await ReceiptOCRService().extract_from_image_bytes(sample_image_bytes)
+
+    assert result["amount"] == 80.0
+    assert result["currency"] == "NIS"
+    assert result["vendor"] == "Cafe Aroma"
+    assert result["expense_date"] == "2026-05-25"
+    assert result["category_hint"] == "Meals"
+    assert result["description"] == "Team meal"
+    assert result["raw_text_summary"] == "Receipt from Cafe Aroma"
+    assert result["source_language"] == "he"
+    gemini.assert_called_once()
+
+
+async def test_extract_hebrew_vendor_lowers_confidence(mocker, sample_image_bytes):
+    mocker.patch.object(
+        ReceiptOCRService,
+        "_call_gemini_json",
+        return_value={
+            "amount": "80 ש״ח",
+            "currency": None,
+            "vendor": "קפה ארומה",
+            "expense_date": "25/05/2026",
+            "category_hint": "Meals",
+            "description": "Team meal",
+            "raw_text_summary": "קבלה מקפה ארומה",
+            "source_language": "he",
+            "confidence": {"overall": 0.94, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        },
+    )
+
+    result = await ReceiptOCRService().extract_from_image_bytes(sample_image_bytes)
+
+    assert result["confidence"]["overall"] == 0.35
+    assert "vendor" in ReceiptOCRService().dashboard_english_errors(result)
+
+
+async def test_extract_hebrew_description_is_nulled_not_blocking(mocker, sample_image_bytes):
+    mocker.patch.object(
+        ReceiptOCRService,
+        "_call_gemini_json",
+        return_value={
+            "amount": "80 ש״ח",
+            "currency": None,
+            "vendor": "Cafe Aroma",
+            "expense_date": "25/05/2026",
+            "category_hint": "Meals",
+            "description": "ארוחת צוות",
+            "raw_text_summary": "קבלה מקפה ארומה",
+            "source_language": "he",
+            "confidence": {"overall": 0.94, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        },
+    )
+
+    result = await ReceiptOCRService().extract_from_image_bytes(sample_image_bytes)
+
+    assert result["confidence"]["overall"] == 0.94
+    assert result["description"] is None
+    assert ReceiptOCRService().dashboard_english_guard(result)["clean"] is True
+
+
+def test_hebrew_shekel_amount_formats():
+    svc = ReceiptOCRService()
+    for raw in ("₪80", '80 ש"ח', "80 ש״ח", "80 שח"):
+        assert svc._parse_amount_string(raw) == 80.0
+
+
+def test_hebrew_grand_total_summary_sets_amount():
+    result = ReceiptOCRService()._validate_and_normalize(
+        {
+            "raw_text_summary": 'מע"מ 13.56 סה״כ לתשלום 80 ש״ח',
+            "confidence": {},
+        }
+    )
+
+    assert result["amount"] == 80.0
+    assert result["currency"] == "NIS"
+
+
+def test_transaction_date_preferred_when_labeled_after_print_date():
+    result = ReceiptOCRService()._validate_and_normalize(
+        {
+            "raw_text_summary": "Print date: 2026-05-25 Transaction date: 2026-05-24 Total: 80 NIS",
+            "confidence": {},
+        }
+    )
+
+    assert result["expense_date"] == "2026-05-24"
+    assert result["amount"] == 80.0
+
+
+async def test_parse_manual_hebrew_labels_without_clean_colons(mocker):
+    gemini = mocker.patch.object(
+        ReceiptOCRService,
+        "_call_gemini_json",
+        return_value={
+            "amount": 80,
+            "currency": "NIS",
+            "vendor": "Cafe Aroma",
+            "expense_date": "2026-05-25",
+            "category": "Meals",
+            "description": "Team meal",
+            "source_language": "he",
+        },
+    )
+
+    result = await ReceiptOCRService().parse_manual_details(
+        "סה״כ לתשלום 80 שח בית עסק קפה ארומה תאריך 25/05/2026 קטגוריה קפה תיאור ארוחת צוות"
+    )
+
+    assert result["amount"] == 80.0
+    assert result["currency"] == "NIS"
+    assert result["vendor"] == "Cafe Aroma"
+    assert result["expense_date"] == "2026-05-25"
+    assert result["category"] == "Meals"
+    assert result["description"] == "Team meal"
+    gemini.assert_called_once()
+
+
+def test_normalize_ocr_output_cleans_embedded_labels():
+    result = ReceiptOCRService()._validate_and_normalize(
+        {
+            "amount": "250.00 NIS Vendor: Cafe Aroma",
+            "currency": "NIS",
+            "vendor": "Cafe Aroma Date: 2026-05-25 Category: Meals Description: Team lunch",
+            "expense_date": "2026-05-25 Category: Meals",
+            "category_hint": "Meals Description: Team lunch",
+            "description": None,
+            "raw_text_summary": "Receipt",
+            "confidence": {"overall": 0.91, "amount": 0.9, "vendor": 0.9, "date": 0.9, "category": 0.9},
+        }
+    )
+
+    assert result["amount"] == 250.0
+    assert result["currency"] == "NIS"
+    assert result["vendor"] == "Cafe Aroma"
+    assert result["expense_date"] == "2026-05-25"
+    assert result["category_hint"] == "Meals"
+    assert result["description"] == "Team lunch"
+
+
+def test_normalize_ocr_output_splits_labeled_blob():
+    result = ReceiptOCRService()._validate_and_normalize(
+        {
+            "amount": None,
+            "currency": None,
+            "vendor": "Vendor: Cafe Aroma Date: 2026-05-25 Category: Meals Description: Team lunch Amount: 250 NIS",
+            "expense_date": None,
+            "category_hint": None,
+            "description": None,
+            "raw_text_summary": "Receipt",
+            "confidence": {"overall": 0.88},
+        }
+    )
+
+    assert result["amount"] == 250.0
+    assert result["currency"] == "NIS"
+    assert result["vendor"] == "Cafe Aroma"
+    assert result["expense_date"] == "2026-05-25"
+    assert result["category_hint"] == "Meals"
+    assert result["description"] == "Team lunch"
+
+
 def test_gemini_api_key_is_sent_in_header_not_url(mocker):
     captured = {}
 
